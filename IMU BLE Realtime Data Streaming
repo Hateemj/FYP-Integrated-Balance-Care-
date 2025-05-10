@@ -1,0 +1,329 @@
+#include <iostream>
+#include <ctime>
+#include <sstream>
+#include <iomanip>
+#include <string>
+#include <thread>
+#include <atomic>
+#include <map>
+#include <fstream>  // For std::ofstream
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "Ws2_32.lib")
+#include "xdpchandler.h"
+
+// Enum to define device states
+enum class IMUState {
+    Disconnected,
+    Connected,
+    Measuring,
+    Paused
+};
+
+// Global flags for stopping and pausing
+std::atomic<bool> stopSignal(false);
+std::atomic<bool> pauseSignal(false);
+
+// Global map for CSV file streams (replacing the old deviceLogFiles map)
+std::map<std::string, std::ofstream> csvFiles;
+
+IMUState currentState = IMUState::Disconnected;
+
+using namespace std;
+
+// Function to initialize and connect devices
+bool initializeAndConnect(XdpcHandler& xdpcHandler) {
+    if (currentState != IMUState::Disconnected) {
+        cout << "Cannot connect: devices are not in the Disconnected state.\n";
+        return false;
+    }
+    if (!xdpcHandler.initialize()) {
+        cout << "Initialization failed.\n";
+        return -1;
+    }
+    xdpcHandler.scanForDots();
+    if (xdpcHandler.detectedDots().empty()) {
+        cout << "No Movella DOT device(s) found. Aborting.\n";
+        xdpcHandler.cleanup();
+        return -1;
+    }
+    xdpcHandler.connectDots();
+    if (xdpcHandler.connectedDots().empty()) {
+        cout << "Could not connect to any Movella DOT device(s). Aborting.\n";
+        xdpcHandler.cleanup();
+        return -1;
+    }
+    currentState = IMUState::Connected;
+    return true;
+}
+
+// Function to get current date and time as a string
+std::string getCurrentDateTime() {
+    auto now = std::time(nullptr);
+    std::ostringstream oss;
+    oss << std::put_time(std::localtime(&now), "%Y-%m-%d_%H-%M-%S");
+    return oss.str();
+}
+
+// Function to configure devices
+void configureDevices(XdpcHandler& xdpcHandler) {
+    for (auto& device : xdpcHandler.connectedDots()) {
+        auto filterProfiles = device->getAvailableFilterProfiles();
+        cout << filterProfiles.size() << " available filter profiles:\n";
+        for (auto& f : filterProfiles)
+            cout << f.label() << "\n";
+        cout << "Current profile: " << device->onboardFilterProfile().label() << "\n";
+        if (device->setOnboardFilterProfile(XsString("General")))
+            cout << "Successfully set profile to General\n";
+        else
+            cout << "Setting filter profile failed!\n";
+        cout << "Setting quaternion CSV output" << endl;
+        device->setLogOptions(XsLogOptions::Quaternion);
+
+        // Generate a unique CSV file name with date and time
+        std::string dateTime = getCurrentDateTime();
+        std::string csvFilePath = "C:\\Users\\hamee\\Documents\\University 3rd Year\\FYP Movella software\\DataLoggingFolderCSV\\"
+            + device->bluetoothAddress().replacedAll(":", "-").toStdString() + "_" + dateTime + ".csv";
+
+        // Open CSV file stream and store it in the csvFiles map
+        csvFiles[device->bluetoothAddress().toStdString()] = std::ofstream(csvFilePath);
+        if (!csvFiles[device->bluetoothAddress().toStdString()].is_open()) {
+            cout << "Failed to open CSV file: " << csvFilePath << "\n";
+        }
+        if (!device->enableLogging(XsString(csvFilePath)))
+            cout << "Failed to enable logging. Reason: " << device->lastResultText() << "\n";
+        if (!device->startMeasurement(XsPayloadMode::ExtendedQuaternion)) {
+            cout << "Could not put device into measurement mode. Reason: " << device->lastResultText() << "\n";
+            continue;
+        }
+    }
+    currentState = IMUState::Measuring;
+}
+
+// Function to stop measurement
+void stopMeasurement(XdpcHandler& xdpcHandler) {
+    if (currentState != IMUState::Measuring && currentState != IMUState::Paused) {
+        cout << "Cannot stop: devices are not in the Measuring or Paused state.\n";
+        return;
+    }
+    for (auto device : xdpcHandler.connectedDots()) {
+        if (!device->stopMeasurement())
+            cout << "Failed to stop measurement for device: " << device->bluetoothAddress().toStdString() << "\n";
+        else
+            cout << "Measurement stopped for device: " << device->bluetoothAddress().toStdString() << "\n";
+        // Ensure a new log file will be created on next start
+        device->disableLogging();
+    }
+    currentState = IMUState::Connected;
+}
+
+// Function to reset devices
+void resetDevices(XdpcHandler& xdpcHandler) {
+    if (currentState == IMUState::Disconnected) {
+        cout << "Devices are already reset.\n";
+        return;
+    }
+    stopSignal.store(true);
+    for (auto const& device : xdpcHandler.connectedDots()) {
+        cout << endl << "Resetting heading to default for device " << device->bluetoothAddress() << ": ";
+        if (device->resetOrientation(XRM_DefaultAlignment))
+            cout << "OK";
+        else
+            cout << "NOK: " << device->lastResultText();
+    }
+    cout << endl << endl;
+    stopMeasurement(xdpcHandler);
+    currentState = IMUState::Disconnected;
+    cout << "Devices reset and resources cleaned up.\n";
+}
+
+// Helper function to send data to Unity via UDP
+void sendDataToUnity(const std::string& message, SOCKET udpSocket, const sockaddr_in& unityAddr)
+{
+    sendto(udpSocket, message.c_str(), (int)message.size(), 0, (struct sockaddr*)&unityAddr, sizeof(unityAddr));
+}
+
+// Function to log data indefinitely with pause/resume and send UDP packets to Unity
+void logDataIndefinitely(XdpcHandler& xdpcHandler) {
+    cout << "\nStarting data logging. Type 'pause' to pause, 'resume' to continue, or 'stop' to end.\n";
+    cout << string(83, '-') << endl;
+
+    // Display CSV file information for each device
+    for (const auto& entry : csvFiles) {
+        cout << "Device: " << entry.first << " is logging data to its CSV file.\n";
+    }
+
+    bool orientationResetDone = false;
+    int64_t startTime = XsTime::timeStampNow();
+    cout << endl << " *** RESETTING HEADING ORIENTATION (YAW) *** \n";
+
+    // Initialize UDP socket for sending data to Unity
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in unityAddr;
+    unityAddr.sin_family = AF_INET;
+    unityAddr.sin_port = htons(8051);  // Must match Unity's listening port
+    unityAddr.sin_addr.s_addr = inet_addr("127.0.0.1"); // Sending to localhost
+
+    while (!stopSignal.load()) {
+        // Handle pause state
+        if (pauseSignal.load()) {
+            currentState = IMUState::Paused;
+            for (auto device : xdpcHandler.connectedDots()) {
+                device->stopMeasurement();
+                cout << "\nLogging paused. Type 'resume' to continue...\n";
+                while (pauseSignal.load() && !stopSignal.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Wait while paused
+                }
+                if (!stopSignal.load()) {
+                    cout << "\nResuming logging...\n";
+                    currentState = IMUState::Measuring;
+                    device->startMeasurement(XsPayloadMode::ExtendedQuaternion);
+                }
+            }
+        }
+
+        // Handle data logging, CSV output, and sending to Unity
+        if (xdpcHandler.packetsAvailable()) {
+            std::cout << "\r"; // Overwrite the current line
+            for (const auto& device : xdpcHandler.connectedDots()) {
+                XsDataPacket packet = xdpcHandler.getNextPacket(device->bluetoothAddress());
+                std::string deviceAddress = device->bluetoothAddress().toStdString();
+
+                // Check CSV file
+                if (csvFiles.find(deviceAddress) == csvFiles.end()) {
+                    std::cerr << "Error: No CSV file available for device " << deviceAddress << "\n";
+                    continue;
+                }
+                std::ofstream& csvFile = csvFiles[deviceAddress];
+
+                std::ostringstream dataStream;
+                // Timestamp
+                if (packet.containsSampleTimeFine()) {
+                    uint32_t timestamp = packet.sampleTimeFine();
+                    csvFile << timestamp << ",";
+                    dataStream << timestamp << ",";
+                }
+                else {
+                    csvFile << "NA,";
+                    dataStream << "NA,";
+                }
+
+                // Quaternion
+                if (packet.containsOrientation()) {
+                    XsQuaternion quaternion = packet.orientationQuaternion();
+                    std::cout << "Device: " << deviceAddress
+                        << "| QW:" << std::setw(5) << std::fixed << std::setprecision(2) << quaternion.w()
+                        << ", QX:" << std::setw(5) << std::fixed << std::setprecision(2) << quaternion.x()
+                        << ", QY:" << std::setw(5) << std::fixed << std::setprecision(2) << quaternion.y()
+                        << ", QZ:" << std::setw(5) << std::fixed << std::setprecision(2) << quaternion.z()
+                        << "  |  ";
+                    csvFile << quaternion.w() << "," << quaternion.x() << "," << quaternion.y() << "," << quaternion.z() << ",";
+                    dataStream << quaternion.w() << "," << quaternion.x() << "," << quaternion.y() << "," << quaternion.z() << ",";
+                }
+                else {
+                    csvFile << "NA,NA,NA,NA,";
+                    dataStream << "NA,NA,NA,NA,";
+                }
+
+                // Free Acceleration
+                if (packet.containsFreeAcceleration()) {
+                    auto freeAcc = packet.freeAcceleration();
+                    std::cout << "FA:"
+                        << std::setw(5) << std::fixed << std::setprecision(2) << freeAcc[0]
+                        << ", " << std::setw(5) << std::fixed << std::setprecision(2) << freeAcc[1]
+                        << ", " << std::setw(5) << std::fixed << std::setprecision(2) << freeAcc[2]
+                        << "  |  ";
+                    csvFile << freeAcc[0] << "," << freeAcc[1] << "," << freeAcc[2] << ",";
+                    dataStream << freeAcc[0] << "," << freeAcc[1] << "," << freeAcc[2] << ",";
+                }
+                else {
+                    csvFile << "NA,NA,NA,";
+                    dataStream << "NA,NA,NA,";
+                }
+
+                // Send data string to Unity
+                std::string dataString = dataStream.str();
+                sendDataToUnity(dataString, udpSocket, unityAddr);
+            }
+            std::cout << std::flush;
+
+            // Reset device heading after 5 seconds if not already done
+            if (!orientationResetDone && (XsTime::timeStampNow() - startTime) > 5000) {
+                for (auto const& device : xdpcHandler.connectedDots()) {
+                    std::cout << std::endl << "Resetting device heading:  " << device->bluetoothAddress() << ": ";
+                    if (device->resetOrientation(XRM_Heading))
+                        std::cout << "SUCCESS \n";
+                    else
+                        std::cout << "FAIL: " << device->lastResultText();
+                }
+                std::cout << std::endl;
+                orientationResetDone = true;
+            }
+        }
+        XsTime::msleep(0);
+    }
+
+    cout << "\n" << string(83, '-') << "\n";
+    cout << "Logging stopped.\n";
+
+    closesocket(udpSocket);
+    WSACleanup();
+}
+
+// Main function
+int main() {
+    XdpcHandler xdpcHandler;
+    while (true) {
+        std::string command;
+        cout << "\nEnter a command (connect, start, stop, pause, resume, reset, exit): ";
+        cin >> command;
+        if (command == "connect") {
+            if (initializeAndConnect(xdpcHandler)) {
+                cout << "Devices connected successfully.\n";
+            }
+        }
+        else if (command == "start") {
+            if (currentState == IMUState::Connected) {
+                configureDevices(xdpcHandler);
+                stopSignal.store(false);
+                pauseSignal.store(false);
+                std::thread loggingThread(logDataIndefinitely, std::ref(xdpcHandler));
+                loggingThread.detach();
+            }
+            else {
+                cout << "Cannot start: devices are not in the Connected state.\n";
+            }
+        }
+        else if (command == "stop") {
+            stopSignal.store(true);
+            stopMeasurement(xdpcHandler);
+        }
+        else if (command == "pause") {
+            if (currentState == IMUState::Measuring)
+                pauseSignal.store(true);
+            else
+                cout << "Cannot pause: devices are not in the Measuring state.\n";
+        }
+        else if (command == "resume") {
+            if (currentState == IMUState::Paused)
+                pauseSignal.store(false);
+            else
+                cout << "Cannot resume: devices are not in the Paused state.\n";
+        }
+        else if (command == "reset") {
+            resetDevices(xdpcHandler);
+        }
+        else if (command == "exit") {
+            stopSignal.store(true);
+            pauseSignal.store(false);
+            stopMeasurement(xdpcHandler);
+            break;
+        }
+        else {
+            cout << "Invalid command.\n";
+        }
+    }
+    return 0;
+}
